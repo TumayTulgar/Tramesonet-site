@@ -1,0 +1,10 @@
+metpy
+pandas
+numpy
+matplotlib
+requests
+xarray
+cfgrib
+rasterio
+scipy
+ecmwf-opendata
