@@ -1,7 +1,6 @@
 # =============================================================================
 # TRAMESONET - OTONOM KİNEMATİK & ADVEKSİYON AJANI (GITHUB ACTIONS)
-# ECMWF Grib + Spatial DEM + Navier Stokes Fiziği
-# Telegram vb. yan modüllerden arındırılmış, saf veri toplama versiyonudur.
+# ECMWF Grib + Spatial DEM + Navier Stokes Fiziği + 30 Dk Vektörel Filtre
 # =============================================================================
 
 import os
@@ -10,7 +9,7 @@ import math
 import json
 import requests
 import warnings
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 import numpy as np
 import xarray as xr
@@ -26,13 +25,12 @@ from metpy.units import units
 warnings.filterwarnings("ignore")
 
 # =============================================================================
-# GÜVENLİK VE ÇEVRE DEĞİŞKENLERİ (GITHUB SECRETS)
+# GÜVENLİK VE ÇEVRE DEĞİŞKENLERİ
 # =============================================================================
 W_KEY = os.environ.get("WUNDERGROUND_API_KEY", "SECRET_YOK")
 FIREBASE_URL = "https://tramesonet-wunderground-default-rtdb.firebaseio.com/"
 FIREBASE_SECRET = os.environ.get("FIREBASE_SECRET", "")
 
-# Fiziksel Sabitler
 G = 9.80665 * units('m/s^2')
 MU = 0.1 / units('s')
 DT = 1.0 * units('s')
@@ -51,15 +49,14 @@ STATIONS = [
 ]
 
 # =============================================================================
-# YARDIMCI VE I/O FONKSİYONLARI
+# I/O FONKSİYONLARI VE DEM
 # =============================================================================
 def send_to_firebase(data, timestamp_str):
     path = f"{FIREBASE_URL}/logs/{timestamp_str}/{data['Station']}.json"
     if FIREBASE_SECRET: path += f"?auth={FIREBASE_SECRET}"
     try:
-        res = requests.put(path, data=json.dumps(data), timeout=10)
-        if res.status_code != 200: print(f" [!] {data['Station']} DB Hatası: {res.text}")
-    except Exception as e: print(f" [!] Bağlantı Hatası: {e}")
+        requests.put(path, data=json.dumps(data), timeout=10)
+    except Exception as e: print(f" [!] DB Bağlantı Hatası: {e}")
 
 class DEMLoader:
     def __init__(self, tif_path="output_hh.tif"):
@@ -79,7 +76,7 @@ class DEMLoader:
         except: return 0.0, 0.0, 0.0
 
 # =============================================================================
-# KİNEMATİK VE TRAJEKTÖR FİZİĞİ
+# FİZİK MOTORU
 # =============================================================================
 def calculate_regional_kinematics(station_data_list):
     valid = [d for d in station_data_list if not np.isnan(d['u']) and not np.isnan(d['v'])]
@@ -129,10 +126,10 @@ class KineticParcel:
 # ANA OPERASYON
 # =============================================================================
 if __name__ == "__main__":
-    print("=== TRAMESONET OTONOM AJANI BAŞLATILDI ===")
+    print("=== TRAMESONET OTONOM AJANI BAŞLATILDI (30DK FİLTRE) ===")
     
     if W_KEY == "SECRET_YOK":
-        print("[!] HATA: WUNDERGROUND_API_KEY bulunamadı. Çıkılıyor.")
+        print("[!] HATA: WUNDERGROUND_API_KEY bulunamadı.")
         sys.exit(1)
 
     dem = DEMLoader("output_hh.tif")
@@ -143,29 +140,45 @@ if __name__ == "__main__":
     try:
         ecmwf_client.retrieve(type="fc", step=0, param=["t", "r", "u", "v"], levelist=PRESSURE_LEVELS, target="ecmwf_data.grib")
     except Exception as e:
-        print(f"[!] ECMWF Hatası: {e}")
         sys.exit(1)
 
-    print("-> İstasyon Verileri Çekiliyor...")
+    print("-> İstasyon Verileri Çekiliyor (Son 30 Dk Vektörel Ortalama)...")
     raw_data = []
+    now_utc = datetime.now(timezone.utc)
+    
     for s_id in STATIONS:
         try:
-            url = f"https://api.weather.com/v2/pws/observations/current?stationId={s_id}&format=json&units=m&apiKey={W_KEY}"
-            d = requests.get(url, timeout=5).json()['observations'][0]
-            m = d['metric']
-            ws = (m['windSpeed']*1000/3600)*units('m/s')
-            u, v = mpcalc.wind_components(ws, d['winddir']*units.degrees)
+            url = f"https://api.weather.com/v2/pws/observations/all/1day?stationId={s_id}&format=json&units=m&apiKey={W_KEY}&numericPrecision=decimal"
+            obs_list = requests.get(url, timeout=5).json().get('observations', [])
+            
+            if not obs_list: continue
+            
+            recent_obs = [obs for obs in obs_list if (now_utc - datetime.strptime(obs['obsTimeUtc'], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).total_seconds() <= 1800]
+            if not recent_obs: recent_obs = [obs_list[-1]]
+                
+            u_list, v_list, t_list, td_list = [], [], [], []
+            precip_total = recent_obs[-1]['metric'].get('precipTotal', 0.0)
+            
+            for obs in recent_obs:
+                m = obs['metric']
+                t_list.append(m['temp'])
+                td_list.append(m.get('dewpt') or m['temp']-2)
+                ws = (m['windSpeed']*1000/3600)*units('m/s')
+                u, v = mpcalc.wind_components(ws, obs['winddir']*units.degrees)
+                u_list.append(u.magnitude); v_list.append(v.magnitude)
+                
             raw_data.append({
-                "id": s_id, "lat": d['lat'], "lon": d['lon'], "t": m['temp'], 
-                "td": m.get('dewpt') or m['temp']-2, "u": u.magnitude, "v": v.magnitude, 
-                "speed": m['windSpeed'], "dir": d['winddir'], "precip_total": m.get('precipTotal', 0)
+                "id": s_id, "lat": recent_obs[-1]['lat'], "lon": recent_obs[-1]['lon'],
+                "t": sum(t_list)/len(t_list), "td": sum(td_list)/len(td_list),
+                "u": sum(u_list)/len(u_list), "v": sum(v_list)/len(v_list),
+                "speed": math.sqrt((sum(u_list)/len(u_list))**2 + (sum(v_list)/len(v_list))**2)*3.6,
+                "precip_total": precip_total
             })
         except: pass
 
     network = calculate_regional_kinematics(raw_data)
     safe_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    print(f"-> Analiz ve Firebase Senkronizasyonu Başlıyor ({safe_timestamp})")
-
+    
     ds = xr.open_dataset("ecmwf_data.grib", engine="cfgrib", backend_kwargs={'indexpath':''})
 
     for s in network:
@@ -197,7 +210,6 @@ if __name__ == "__main__":
             
             max_w = path_df['w'].max() if not path_df.empty else (w_dyn+w_oro_eff)*0.5
 
-            # JSON Serileştirme Korumalı Veri Paketi
             data_to_store = {
                 "Station": str(s['id']), "Timestamp": str(safe_timestamp),
                 "Coordinates": {"lat": float(s['lat']), "lon": float(s['lon'])},
@@ -211,7 +223,6 @@ if __name__ == "__main__":
             
             send_to_firebase(data_to_store, safe_timestamp)
                 
-        except Exception as e: print(f" [!] {s['id']} hesabı atlandı: {e}")
+        except Exception as e: pass
 
     ds.close()
-    print("=== OTONOM DÖNGÜ TAMAMLANDI ===")
